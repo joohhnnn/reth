@@ -1,4 +1,7 @@
-//! Helper type that represents one of two possible executor types
+//! 辅助类型：表示两种可能的执行器类型之一。
+//!
+//! 使用 `Either<A, B>` 允许在运行时选择两种不同的执行器实现，
+//! 同时保持静态分发。常见于需要根据配置选择不同执行策略的场景。
 
 use crate::{execute::Executor, Database, OnStateHook};
 

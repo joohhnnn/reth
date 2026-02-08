@@ -1,4 +1,13 @@
-//! Traits for execution.
+//! 区块执行相关的 trait 和类型定义。
+//!
+//! 本模块包含:
+//! - [`Executor`] trait: 区块执行的核心抽象，支持单块和批量执行
+//! - [`BlockAssembler`] trait: 从执行结果组装完整区块
+//! - [`BlockBuilder`] trait: 编排交易执行和区块构建的完整流程
+//! - [`BasicBlockExecutor`]: 基于 ConfigureEvm 的通用区块执行器实现
+//! - [`BasicBlockBuilder`]: 区块构建器的具体实现
+//! - [`BlockAssemblerInput`]: 区块组装所需的输入数据
+//! - [`BlockBuilderOutcome`]: 区块构建的输出结果
 
 use crate::{ConfigureEvm, Database, OnStateHook, TxEnvFor};
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
@@ -26,15 +35,31 @@ use revm::{
     database::{states::bundle_state::BundleRetention, BundleState, State},
 };
 
-/// A type that knows how to execute a block. It is assumed to operate on a
-/// [`crate::Evm`] internally and use [`State`] as database.
+/// 区块执行器 trait —— 知道如何执行一个区块。
+///
+/// 内部使用 [`crate::Evm`] 执行交易，并使用 [`State`] 作为数据库。
+/// 这是执行层最核心的 trait 之一。
+///
+/// ## 主要方法
+/// - `execute_one()`: 执行单个区块，仅返回执行结果（不含状态变更）
+/// - `execute()`: 执行区块并返回完整输出（包含状态变更 BundleState）
+/// - `execute_batch()`: 批量执行多个区块，返回聚合的 ExecutionOutcome
+/// - `into_state()`: 消费执行器，返回包含所有状态变更的 State
+///
+/// ## 数据流
+/// ```text
+/// Block → execute_one() → BlockExecutionResult（收据、gas 等）
+///       → into_state()  → State（BundleState 状态变更）
+///       → execute()     → BlockExecutionOutput（结果 + 状态变更）
+/// ```
 pub trait Executor<DB: Database>: Sized {
-    /// The primitive types used by the executor.
+    /// 执行器使用的原语类型（包含 Block、Transaction、Receipt 等类型定义）。
     type Primitives: NodePrimitives;
-    /// The error type returned by the executor.
+    /// 执行器返回的错误类型。
     type Error;
 
-    /// Executes a single block and returns [`BlockExecutionResult`], without the state changes.
+    /// 执行单个区块，返回 [`BlockExecutionResult`]（收据、gas 使用量、请求），不包含状态变更。
+    /// 状态变更会累积在内部的 State 中，可通过 `into_state()` 获取。
     fn execute_one(
         &mut self,
         block: &RecoveredBlock<<Self::Primitives as NodePrimitives>::Block>,
@@ -239,11 +264,16 @@ impl<'a, 'b, F: BlockExecutorFactory, H> BlockAssemblerInput<'a, 'b, F, H> {
     }
 }
 
-/// A type that knows how to assemble a block from execution results.
+/// 区块组装器 trait —— 知道如何从执行结果组装出一个完整的区块。
 ///
-/// The [`BlockAssembler`] is the final step in block production. After transactions
-/// have been executed by the [`BlockExecutor`], the assembler takes all the execution
-/// outputs and creates a properly formatted block.
+/// [`BlockAssembler`] 是区块生产的最后一步。在 [`BlockExecutor`] 执行完所有交易之后，
+/// 组装器接收全部执行输出并创建格式正确的区块。
+///
+/// ## 职责
+/// - 设置正确的区块头字段（gas used, receipts root, logs bloom 等）
+/// - 按正确顺序包含已执行的交易
+/// - 设置执行后的状态根（state root）
+/// - 应用链特定规则（以太坊 vs Optimism 等）
 ///
 /// # Responsibilities
 ///
@@ -293,29 +323,41 @@ pub trait BlockAssembler<F: BlockExecutorFactory> {
     ) -> Result<Self::Block, BlockExecutionError>;
 }
 
-/// Output of block building.
+/// 区块构建的输出结果。
+///
+/// 包含构建一个新区块后的所有产出:
+/// - 执行结果（收据、gas 等）
+/// - 哈希状态（用于 trie 更新）
+/// - Trie 更新（增量更新数据库中的 Merkle Patricia Trie）
+/// - 最终的完整区块
 #[derive(Debug, Clone)]
 pub struct BlockBuilderOutcome<N: NodePrimitives> {
-    /// Result of block execution.
+    /// 区块执行结果（收据列表、总 gas 使用量、EIP-7685 请求）。
     pub execution_result: BlockExecutionResult<N::Receipt>,
-    /// Hashed state after execution.
+    /// 执行后的哈希状态（账户和存储的 keccak256 哈希映射）。
+    /// 用于增量计算状态根。
     pub hashed_state: HashedPostState,
-    /// Trie updates collected during state root calculation.
+    /// 状态根计算过程中收集的 Trie 更新（需要写入数据库的 trie 节点变更）。
     pub trie_updates: TrieUpdates,
-    /// The built block.
+    /// 构建出的完整区块（包含区块头、交易列表、发送者列表等）。
     pub block: RecoveredBlock<N::Block>,
 }
 
-/// A type that knows how to execute and build a block.
+/// 区块构建器 trait —— 知道如何执行交易并构建区块。
 ///
-/// It wraps an inner [`BlockExecutor`] and provides a way to execute transactions and
-/// construct a block.
+/// 包装了一个内部的 [`BlockExecutor`]，提供执行交易和构建区块的方法。
+/// 这是构建新区块（payload building）时使用的核心接口。
 ///
-/// This is a helper to erase `BasicBlockBuilder` type.
+/// ## 使用流程
+/// ```text
+/// 1. apply_pre_execution_changes()  → 应用执行前变更（如 EIP-4788 Beacon 根更新）
+/// 2. execute_transaction(tx)        → 逐个执行交易（可多次调用）
+/// 3. finish(state_provider)         → 完成构建，计算状态根，组装区块
+/// ```
 pub trait BlockBuilder {
-    /// The primitive types used by the inner [`BlockExecutor`].
+    /// 内部 [`BlockExecutor`] 使用的原语类型。
     type Primitives: NodePrimitives;
-    /// Inner [`BlockExecutor`].
+    /// 内部的区块执行器类型。
     type Executor: BlockExecutor<
         Transaction = TxTy<Self::Primitives>,
         Receipt = ReceiptTy<Self::Primitives>,
@@ -522,13 +564,24 @@ where
     }
 }
 
-/// A generic block executor that uses a [`BlockExecutor`] to
-/// execute blocks.
+/// 通用区块执行器 —— 使用 [`ConfigureEvm`] 来执行区块。
+///
+/// 这是 `Executor` trait 的主要具体实现。内部持有:
+/// - `strategy_factory`: EVM 配置（实现了 ConfigureEvm），用于为每个区块创建执行策略
+/// - `db`: revm 的 State 数据库，带有 bundle 更新跟踪，用于累积多个区块的状态变更
+///
+/// ## 执行流程
+/// 1. 对每个区块调用 `execute_one()`
+/// 2. 通过 strategy_factory 创建该区块的执行器
+/// 3. 执行区块中的所有交易
+/// 4. 合并状态转换到 bundle state
+/// 5. 最终通过 `into_state()` 获取完整的状态变更
 #[expect(missing_debug_implementations)]
 pub struct BasicBlockExecutor<F, DB> {
-    /// Block execution strategy.
+    /// 区块执行策略工厂（即 ConfigureEvm 实现），用于为每个区块创建 EVM 环境和执行器。
     pub(crate) strategy_factory: F,
-    /// Database.
+    /// revm 的 State 数据库包装，跟踪所有状态变更（账户余额、nonce、存储槽等）。
+    /// 启用了 bundle_update，可以累积多个区块的变更。
     pub(crate) db: State<DB>,
 }
 

@@ -23,23 +23,45 @@ use reth_trie_common::{
 use tracing::debug;
 use tracing::{instrument, trace};
 
+/// 稀疏状态 trie —— 以太坊状态树的懒加载实现。
+///
+/// 管理完整的以太坊状态，包括:
+/// - **账户 trie** (`state`): 全局状态树，存储所有账户信息
+/// - **存储 trie** (`storage`): 每个账户各自的存储树
+///
+/// ## 核心设计
+/// - **懒加载**: 通过 Merkle 证明按需揭示节点，而非加载整棵 trie
+/// - **并行揭示**: 在 `std` 环境下，多个存储 trie 的证明可以并行揭示
+/// - **内存复用**: 清除的 trie 保留其已分配内存，避免重复分配
+/// - **智能剪枝**: 基于访问频率（热度）决定保留哪些存储 trie
+///
+/// ## 泛型参数
+/// - `A`: 账户 trie 的实现类型（默认 `SerialSparseTrie`）
+/// - `S`: 存储 trie 的实现类型（默认 `SerialSparseTrie`）
+///
+/// ## 典型使用流程
+/// ```text
+/// 1. reveal_multiproof(proof)   → 揭示来自证明的 trie 节点
+/// 2. update_account(addr, acc)  → 更新账户信息
+/// 3. update_storage_leaf(...)   → 更新存储槽
+/// 4. root_with_updates()        → 计算根哈希并获取变更
+/// ```
 #[derive(Debug)]
-/// Sparse state trie representing lazy-loaded Ethereum state trie.
 pub struct SparseStateTrie<
-    A = SerialSparseTrie, // Account trie implementation
-    S = SerialSparseTrie, // Storage trie implementation
+    A = SerialSparseTrie, // 账户 trie 实现
+    S = SerialSparseTrie, // 存储 trie 实现
 > {
-    /// Sparse account trie.
+    /// 稀疏账户 trie（全局状态树），存储 keccak256(address) → TrieAccount 的映射。
     state: RevealableSparseTrie<A>,
-    /// Collection of revealed account trie paths.
+    /// 已揭示的账户 trie 路径集合，用于避免重复揭示。
     revealed_account_paths: HashSet<Nibbles>,
-    /// State related to storage tries.
+    /// 存储 trie 相关状态（包含所有账户的存储 trie、揭示路径、热度追踪等）。
     storage: StorageTries<S>,
-    /// Flag indicating whether trie updates should be retained.
+    /// 是否保留 trie 更新记录（用于后续写回数据库）。
     retain_updates: bool,
-    /// Reusable buffer for RLP encoding of trie accounts.
+    /// 可复用的 RLP 编码缓冲区（避免重复分配）。
     account_rlp_buf: Vec<u8>,
-    /// Metrics for the sparse state trie.
+    /// 稀疏状态 trie 的指标度量。
     #[cfg(feature = "metrics")]
     metrics: crate::metrics::SparseStateTrieMetrics,
 }
@@ -1055,22 +1077,30 @@ where
     }
 }
 
-/// The fields of [`SparseStateTrie`] related to storage tries. This is kept separate from the rest
-/// of [`SparseStateTrie`] both to help enforce allocation re-use and to allow us to implement
-/// methods like `get_trie_and_revealed_paths` which return multiple mutable borrows.
+/// 存储 trie 集合 —— [`SparseStateTrie`] 中与存储 trie 相关的所有字段。
+///
+/// 独立于 `SparseStateTrie` 的其余部分，原因:
+/// 1. 便于强制内存复用（清除的 trie 保存在 `cleared_tries` 中供复用）
+/// 2. 允许返回多个可变借用（如 `get_trie_and_revealed_paths_mut`）
+///
+/// ## 内存管理策略
+/// - 活跃 trie 存储在 `tries` 中
+/// - 被清除的 trie 转移到 `cleared_tries`，保留其已分配内存
+/// - 创建新 trie 时优先从 `cleared_tries` 弹出复用
+/// - `revealed_paths` 和 `cleared_revealed_paths` 同理
 #[derive(Debug, Default)]
 struct StorageTries<S = SerialSparseTrie> {
-    /// Sparse storage tries.
+    /// 活跃的存储 trie 集合（账户哈希地址 → 对应的稀疏存储 trie）。
     tries: B256Map<RevealableSparseTrie<S>>,
-    /// Cleared storage tries, kept for re-use.
+    /// 已清除但保留内存分配的存储 trie，用于复用。
     cleared_tries: Vec<RevealableSparseTrie<S>>,
-    /// Collection of revealed storage trie paths, per account.
+    /// 每个账户已揭示的存储 trie 路径集合（用于避免重复揭示）。
     revealed_paths: B256Map<HashSet<Nibbles>>,
-    /// Cleared revealed storage trie path collections, kept for re-use.
+    /// 已清除但保留内存分配的路径集合，用于复用。
     cleared_revealed_paths: Vec<HashSet<Nibbles>>,
-    /// A default cleared trie instance, which will be cloned when creating new tries.
+    /// 默认的已清除 trie 实例模板，创建新 trie 时克隆此实例。
     default_trie: RevealableSparseTrie<S>,
-    /// Tracks access patterns and modification state of storage tries for smart pruning decisions.
+    /// 存储 trie 的访问模式和修改状态追踪器，用于智能剪枝决策。
     modifications: StorageTrieModifications,
 }
 
@@ -1296,34 +1326,39 @@ struct StorageTriesPruneStats {
     total_elapsed: core::time::Duration,
 }
 
-/// Per-trie access tracking and prune state.
+/// 单个存储 trie 的访问追踪和剪枝状态。
 ///
-/// Tracks how frequently a storage trie is accessed and when it was last pruned,
-/// enabling smart pruning decisions that preserve frequently-used tries.
+/// 追踪存储 trie 被访问的频率和上次剪枝的时间，
+/// 使得剪枝决策能够保留频繁使用的 trie。
 #[derive(Debug, Clone, Copy, Default)]
 #[allow(dead_code)]
 struct TrieModificationState {
-    /// Access frequency level (0-255). Incremented each cycle the trie is accessed.
-    /// Used for prioritizing which tries to keep during pruning.
+    /// 访问热度（0-255）。每个被访问的周期递增。
+    /// 热度越高，剪枝时越优先保留。
     heat: u8,
-    /// Prune backlog - cycles since last prune. Incremented each cycle,
-    /// reset to 0 when pruned. Used to decide when pruning is needed.
+    /// 剪枝积压 —— 距上次剪枝的周期数。每周期递增，剪枝后重置为 0。
+    /// 用于决定何时需要对此 trie 执行剪枝。
     prune_backlog: u8,
 }
 
-/// Tracks access patterns and modification state of storage tries for smart pruning decisions.
+/// 存储 trie 的访问模式和修改状态追踪器。
 ///
-/// Access-based tracking is more accurate than simple generation counting because it tracks
-/// actual access patterns rather than administrative operations (take/insert).
+/// 基于实际访问模式的追踪比简单的代数计数更准确，因为它追踪的是
+/// 真正的访问行为而非管理操作（take/insert）。
 ///
-/// - Access frequency is incremented when a storage proof is revealed (accessed)
-/// - Access frequency decays each prune cycle for tries not accessed that cycle
-/// - Tries with higher access frequency are prioritized for preservation during pruning
+/// ## 工作原理
+/// - 当存储证明被揭示时，对应 trie 的访问频率递增
+/// - 每个剪枝周期，未被访问的 trie 的频率会衰减
+/// - 访问频率更高的 trie 在剪枝时被优先保留
+///
+/// ## 剪枝评分
+/// score = size × heat_multiplier，其中 heat_multiplier = 1 + (heat.min(4) / 2)
+/// 即热度越高的大 trie 得分越高，越可能被保留。
 #[derive(Debug, Default)]
 struct StorageTrieModifications {
-    /// Access frequency and prune state per storage trie address.
+    /// 每个存储 trie 地址对应的访问频率和剪枝状态。
     state: B256Map<TrieModificationState>,
-    /// Tracks which tries were accessed in the current cycle (between prune calls).
+    /// 当前周期（两次剪枝之间）被访问过的 trie 地址集合。
     accessed_this_cycle: HashSet<B256>,
 }
 

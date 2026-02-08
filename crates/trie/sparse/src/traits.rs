@@ -1,4 +1,11 @@
-//! Traits for sparse trie implementations.
+//! 稀疏 Trie 实现的 trait 定义。
+//!
+//! 稀疏 Trie 是一种内存优化的 MPT 实现:
+//! - 未加载的节点以哈希形式存储（盲态/Blind）
+//! - 需要时通过 `reveal_nodes()` 加载节点内容（揭示态/Revealed）
+//! - 只在内存中保留需要操作的部分，而非整棵树
+//!
+//! 这种设计在执行层特别有用，因为一个区块通常只修改很小一部分状态。
 
 use core::fmt::Debug;
 
@@ -13,22 +20,39 @@ use reth_trie_common::{BranchNodeMasks, Nibbles, ProofTrieNode, TrieNode};
 
 use crate::provider::TrieNodeProvider;
 
-/// Describes an update to a leaf in the sparse trie.
+/// 描述稀疏 trie 中叶子节点的更新。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LeafUpdate {
-    /// The leaf value has been changed to the given RLP-encoded value.
-    /// Empty Vec indicates the leaf has been removed.
+    /// 叶子值已更改为给定的 RLP 编码值。空 Vec 表示叶子已被删除。
     Changed(Vec<u8>),
-    /// The leaf value may have changed, but the new value is not yet known.
-    /// Used for optimistic prewarming when the actual value is unavailable.
+    /// 叶子值可能已更改，但新值尚未确定。
+    /// 用于乐观预热（optimistic prewarming），当实际值不可用时使用。
     Touched,
 }
 
-/// Trait defining common operations for revealed sparse trie implementations.
+/// 稀疏 Trie 核心 trait —— 定义了已揭示的稀疏 trie 实现的通用操作。
 ///
-/// This trait abstracts over different sparse trie implementations (serial vs parallel)
-/// while providing a unified interface for the core trie operations needed by the
-/// [`crate::RevealableSparseTrie`] enum.
+/// 抽象了串行和并行两种稀疏 trie 实现，提供统一的 trie 操作接口。
+///
+/// ## 核心操作
+/// - `set_root()`: 设置根节点（从盲态变为揭示态）
+/// - `reveal_nodes()`: 揭示一组 trie 节点（加载到内存）
+/// - `update_leaf()`: 更新叶子节点的值
+/// - `remove_leaf()`: 删除叶子节点
+/// - `root()`: 计算并返回根哈希
+///
+/// ## 节点状态
+/// - **Blind**: 仅知道哈希值，节点内容未加载
+/// - **Revealed**: 节点内容已加载，可以进行读写操作
+///
+/// ## 使用流程
+/// ```text
+/// 1. set_root(root_node)           → 设置根节点
+/// 2. reveal_nodes(proof_nodes)     → 揭示需要操作的路径上的节点
+/// 3. update_leaf(path, value) ×N   → 更新叶子节点
+/// 4. remove_leaf(path) ×N          → 删除叶子节点
+/// 5. root()                        → 计算新的根哈希
+/// ```
 pub trait SparseTrie: Sized + Debug + Send + Sync {
     /// Configures the trie to have the given root node revealed.
     ///
@@ -317,17 +341,17 @@ pub trait SparseTrieExt: SparseTrie {
     ) -> SparseTrieResult<()>;
 }
 
-/// Tracks modifications to the sparse trie structure.
+/// 追踪稀疏 trie 结构的修改。
 ///
-/// Maintains references to both modified and pruned/removed branches, enabling
-/// one to make batch updates to a persistent database.
+/// 维护已修改和已删除的分支节点引用，允许对持久化数据库进行批量更新。
+/// 当稀疏 trie 计算出新的根哈希后，这些更新需要写回数据库。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SparseTrieUpdates {
-    /// Collection of updated intermediate nodes indexed by full path.
+    /// 已更新的中间节点集合（路径 → 紧凑分支节点），需要写入数据库。
     pub updated_nodes: HashMap<Nibbles, BranchNodeCompact>,
-    /// Collection of removed intermediate nodes indexed by full path.
+    /// 已删除的中间节点路径集合，需要从数据库中移除。
     pub removed_nodes: HashSet<Nibbles>,
-    /// Flag indicating whether the trie was wiped.
+    /// 是否整棵 trie 被清除（例如账户被销毁时其存储 trie 被清除）。
     pub wiped: bool,
 }
 

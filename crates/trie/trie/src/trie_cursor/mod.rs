@@ -26,67 +26,75 @@ pub use metrics::{InstrumentedTrieCursor, TrieCursorMetricsCache};
 
 pub use self::{depth_first::DepthFirstTrieIterator, in_memory::*, subnode::CursorSubNode};
 
-/// Factory for creating trie cursors.
+/// Trie 游标工厂 trait。
+///
+/// 创建用于读取数据库中已存储的 trie 分支节点（BranchNodeCompact）的游标。
+/// 这些分支节点是 Merkle Patricia Trie 的中间节点，存储了子节点的哈希值。
+///
+/// ## 两种游标
+/// - 账户 trie 游标: 遍历全局状态 trie 的中间节点
+/// - 存储 trie 游标: 遍历特定账户的存储 trie 的中间节点
 #[auto_impl::auto_impl(&)]
 pub trait TrieCursorFactory {
-    /// The account trie cursor type.
+    /// 账户 trie 游标类型。
     type AccountTrieCursor<'a>: TrieCursor
     where
         Self: 'a;
 
-    /// The storage trie cursor type.
+    /// 存储 trie 游标类型。
     type StorageTrieCursor<'a>: TrieStorageCursor
     where
         Self: 'a;
 
-    /// Create an account trie cursor.
+    /// 创建账户 trie 游标（用于遍历全局状态 trie 的中间节点）。
     fn account_trie_cursor(&self) -> Result<Self::AccountTrieCursor<'_>, DatabaseError>;
 
-    /// Create a storage tries cursor.
+    /// 创建存储 trie 游标（用于遍历指定账户的存储 trie 中间节点）。
     fn storage_trie_cursor(
         &self,
         hashed_address: B256,
     ) -> Result<Self::StorageTrieCursor<'_>, DatabaseError>;
 }
 
-/// A cursor for traversing stored trie nodes. The cursor must iterate over keys in
-/// lexicographical order.
+/// Trie 游标 trait —— 用于遍历数据库中存储的 trie 分支节点。
+///
+/// 游标必须按字典序迭代键。返回的 `BranchNodeCompact` 包含:
+/// - `state_mask`: 哪些子节点存在
+/// - `tree_mask`: 哪些子节点在数据库中有对应的 trie 节点
+/// - `hash_mask`: 哪些子节点有存储的哈希值
+/// - `hashes`: 子节点的哈希值列表
+///
+/// 这些信息让 TrieWalker 能够决定哪些子树需要遍历、哪些可以跳过。
 #[auto_impl::auto_impl(&mut)]
 pub trait TrieCursor {
-    /// Move the cursor to the key and return if it is an exact match.
+    /// 精确查找: 移动游标到指定键，如果精确匹配则返回。
     fn seek_exact(
         &mut self,
         key: Nibbles,
     ) -> Result<Option<(Nibbles, BranchNodeCompact)>, DatabaseError>;
 
-    /// Move the cursor to the key and return a value matching of greater than the key.
+    /// 范围查找: 移动游标到大于等于指定键的位置。
     fn seek(&mut self, key: Nibbles)
         -> Result<Option<(Nibbles, BranchNodeCompact)>, DatabaseError>;
 
-    /// Move the cursor to the next key.
+    /// 移动游标到下一个键。
     fn next(&mut self) -> Result<Option<(Nibbles, BranchNodeCompact)>, DatabaseError>;
 
-    /// Get the current entry.
+    /// 获取当前条目的键。
     fn current(&mut self) -> Result<Option<Nibbles>, DatabaseError>;
 
-    /// Reset the cursor to the beginning.
-    ///
-    /// # Important
-    ///
-    /// After calling this method, the subsequent operation MUST be a [`TrieCursor::seek`] or
-    /// [`TrieCursor::seek_exact`] call.
+    /// 重置游标到起始位置。重置后必须先调用 seek 或 seek_exact。
     fn reset(&mut self);
 }
 
-/// A cursor for traversing storage trie nodes.
+/// 存储 trie 游标 trait —— 继承 TrieCursor，增加设置账户地址的能力。
+///
+/// 由于存储 trie 是按账户隔离的，需要先设置目标账户地址，
+/// 然后才能遍历该账户的存储 trie 节点。
 #[auto_impl::auto_impl(&mut)]
 pub trait TrieStorageCursor: TrieCursor {
-    /// Set the hashed address for the storage trie cursor.
-    ///
-    /// # Important
-    ///
-    /// After calling this method, the subsequent operation MUST be a [`TrieCursor::seek`] or
-    /// [`TrieCursor::seek_exact`] call.
+    /// 设置存储 trie 游标的目标账户哈希地址。
+    /// 设置后必须先调用 seek 或 seek_exact。
     fn set_hashed_address(&mut self, hashed_address: B256);
 }
 

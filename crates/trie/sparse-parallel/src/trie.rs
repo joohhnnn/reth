@@ -21,110 +21,84 @@ use smallvec::SmallVec;
 use std::cmp::{Ord, Ordering, PartialOrd};
 use tracing::{debug, instrument, trace};
 
-/// The maximum length of a path, in nibbles, which belongs to the upper subtrie of a
-/// [`ParallelSparseTrie`]. All longer paths belong to a lower subtrie.
+/// 上层子 trie 的最大路径深度（以 nibble 为单位）。
+/// 路径长度 < 此值的节点属于上层子 trie，>= 此值的节点属于下层子 trie。
+/// 默认为 2，即前两个 nibble 用于确定下层子 trie 的索引。
 pub const UPPER_TRIE_MAX_DEPTH: usize = 2;
 
-/// Number of lower subtries which are managed by the [`ParallelSparseTrie`].
+/// [`ParallelSparseTrie`] 管理的下层子 trie 数量。
+/// = 16^UPPER_TRIE_MAX_DEPTH = 256（前两个 nibble 的所有组合）。
 pub const NUM_LOWER_SUBTRIES: usize = 16usize.pow(UPPER_TRIE_MAX_DEPTH as u32);
 
-/// Configuration for controlling when parallelism is enabled in [`ParallelSparseTrie`] operations.
+/// 并行操作阈值配置 —— 控制何时启用并行处理。
+///
+/// 并行化有开销（线程同步等），小数据量时串行更快。
+/// 此结构允许配置最小阈值，低于阈值时退化为串行处理。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ParallelismThresholds {
-    /// Minimum number of nodes to reveal before parallel processing is enabled.
-    /// When `reveal_nodes` has fewer nodes than this threshold, they will be processed serially.
+    /// 启用并行揭示节点的最小节点数。低于此值时串行处理。
     pub min_revealed_nodes: usize,
-    /// Minimum number of changed keys (prefix set length) before parallel processing is enabled
-    /// for hash updates. When updating subtrie hashes with fewer changed keys than this threshold,
-    /// the updates will be processed serially.
+    /// 启用并行哈希更新的最小变更键数（prefix set 长度）。低于此值时串行处理。
     pub min_updated_nodes: usize,
 }
 
-/// A revealed sparse trie with subtries that can be updated in parallel.
+/// 并行稀疏 trie —— 支持子 trie 并行更新的揭示态稀疏 trie。
 ///
-/// ## Structure
+/// ## 分层结构
 ///
-/// The trie is divided into two tiers for efficient parallel processing:
-/// - **Upper subtrie**: Contains nodes with paths shorter than [`UPPER_TRIE_MAX_DEPTH`]
-/// - **Lower subtries**: An array of [`NUM_LOWER_SUBTRIES`] subtries, each handling nodes with
-///   paths of at least [`UPPER_TRIE_MAX_DEPTH`] nibbles
+/// trie 被分为两层以实现高效并行处理:
+/// - **上层子 trie** (`upper_subtrie`): 包含路径长度 < [`UPPER_TRIE_MAX_DEPTH`] (2) 的节点
+/// - **下层子 trie** (`lower_subtries`): [`NUM_LOWER_SUBTRIES`] (256) 个子 trie，
+///   处理路径长度 >= 2 的节点
 ///
-/// Node placement is determined by path depth:
-/// - Paths with < [`UPPER_TRIE_MAX_DEPTH`] nibbles go to the upper subtrie
-/// - Paths with >= [`UPPER_TRIE_MAX_DEPTH`] nibbles go to lower subtries, indexed by their first
-///   [`UPPER_TRIE_MAX_DEPTH`] nibbles.
+/// 节点分配规则（按路径深度）:
+/// - 路径 < 2 nibble → 上层子 trie（如根节点、第一层分支）
+/// - 路径 >= 2 nibble → 下层子 trie，由前 2 个 nibble 确定索引
 ///
-/// Each lower subtrie tracks its root via the `path` field, which represents the shortest path
-/// in that subtrie. This path will have at least [`UPPER_TRIE_MAX_DEPTH`] nibbles, but may be
-/// longer when an extension node in the upper trie "reaches into" the lower subtrie. For example,
-/// if the upper trie has an extension from `0x1` to `0x12345`, then the lower subtrie for prefix
-/// `0x12` will have its root at path `0x12345` rather than at `0x12`.
+/// ```text
+///        上层 trie (深度 0-1)
+///       /    |    \    ...
+///    [00]  [01]  [02] ... [ff]   ← 256 个下层子 trie
+///     |     |     |
+///   (各自独立的子 trie)
+/// ```
 ///
-/// ## Node Revealing
+/// ## 并行化策略
+/// 由于 256 个下层子 trie 互不重叠，它们的哈希更新可以完全并行:
+/// 1. 并行更新所有已修改的下层子 trie 的哈希
+/// 2. 串行更新上层子 trie（引用下层子 trie 的哈希）
+/// 3. 从上层根节点计算最终根哈希
 ///
-/// The trie uses lazy loading to efficiently handle large state tries. Nodes can be:
-/// - **Blind nodes**: Stored as hashes ([`SparseNode::Hash`]), representing unloaded trie parts
-/// - **Revealed nodes**: Fully loaded nodes (Branch, Extension, Leaf) with complete structure
+/// ## 节点揭示
+/// 使用懒加载：节点初始为盲态（Hash），通过 `reveal_nodes` 按需加载。
+/// 空 trie 在根路径包含 EmptyRoot 节点，而非完全为空。
 ///
-/// Note: An empty trie contains an `EmptyRoot` node at the root path, rather than no nodes at all.
-/// A trie with no nodes is blinded, its root may be `EmptyRoot` or some other node type.
+/// ## 叶子操作
+/// - **更新**: 值存储在对应子 trie 的 values 映射中。新叶子需要创建中间分支节点。
+/// - **删除**: 可能导致父节点修改（移除空分支、将单子分支转为扩展节点）。
+/// - 操作可能导致节点在上下层之间移动。
 ///
-/// Revealing is generally done using pre-loaded node data provided to via `reveal_nodes`. In
-/// certain cases, such as edge-cases when updating/removing leaves, nodes are revealed on-demand.
-///
-/// ## Leaf Operations
-///
-/// **Update**: When updating a leaf, the new value is stored in the appropriate subtrie's values
-/// map. If the leaf is new, the trie structure is updated by walking to the leaf from the root,
-/// creating necessary intermediate branch nodes.
-///
-/// **Removal**: Leaf removal may require parent node modifications. The algorithm walks up the
-/// trie, removing nodes that become empty and converting single-child branches to extensions.
-///
-/// During leaf operations the overall structure of the trie may change, causing nodes to be moved
-/// from the upper to lower trie or vice-versa.
-///
-/// The `prefix_set` is modified during both leaf updates and removals to track changed leaf paths.
-///
-/// ## Root Hash Calculation
-///
-/// Root hash computation follows a bottom-up approach:
-/// 1. Update hashes for all modified lower subtries (can be done in parallel)
-/// 2. Update hashes for the upper subtrie (which may reference lower subtrie hashes)
-/// 3. Calculate the final root hash from the upper subtrie's root node
-///
-/// The `prefix_set` tracks which paths have been modified, enabling incremental updates instead of
-/// recalculating the entire trie.
-///
-/// ## Invariants
-///
-/// - Each leaf entry in the `subtries` and `upper_trie` collection must have a corresponding entry
-///   in `values` collection. If the root node is a leaf, it must also have an entry in `values`.
-/// - All keys in `values` collection are full leaf paths.
+/// ## 不变式
+/// - 每个子 trie 或上层 trie 中的叶子条目必须在 `values` 集合中有对应条目
+/// - `values` 中所有键都是完整的叶子路径
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ParallelSparseTrie {
-    /// This contains the trie nodes for the upper part of the trie.
+    /// 上层子 trie（包含浅层节点，路径长度 < UPPER_TRIE_MAX_DEPTH）。
     upper_subtrie: Box<SparseSubtrie>,
-    /// An array containing the subtries at the second level of the trie.
+    /// 256 个下层子 trie 数组（按前 2 个 nibble 索引）。
     lower_subtries: Box<[LowerSparseSubtrie; NUM_LOWER_SUBTRIES]>,
-    /// Set of prefixes (key paths) that have been marked as updated.
-    /// This is used to track which parts of the trie need to be recalculated.
+    /// 已标记为更新的前缀集合（脏路径），追踪需要重新计算哈希的部分。
     prefix_set: PrefixSetMut,
-    /// Optional tracking of trie updates for later use.
+    /// 可选的 trie 更新追踪（记录已修改/删除的分支节点）。
     updates: Option<SparseTrieUpdates>,
-    /// Branch node masks containing `tree_mask` and `hash_mask` for each path.
-    /// - `tree_mask`: When a bit is set, the corresponding child subtree is stored in the
-    ///   database.
-    /// - `hash_mask`: When a bit is set, the corresponding child is stored as a hash in the
-    ///   database.
+    /// 分支节点掩码（来自数据库的 tree_mask 和 hash_mask）。
     branch_node_masks: BranchNodeMasksMap,
-    /// Reusable buffer pool used for collecting [`SparseTrieUpdatesAction`]s during hash
-    /// computations.
+    /// 可复用的缓冲区池，用于收集哈希计算过程中的 [`SparseTrieUpdatesAction`]。
     update_actions_buffers: Vec<Vec<SparseTrieUpdatesAction>>,
-    /// Thresholds controlling when parallelism is enabled for different operations.
+    /// 并行操作阈值配置。
     parallelism_thresholds: ParallelismThresholds,
-    /// Tracks heat of lower subtries for smart pruning decisions.
-    /// Hot subtries are skipped during pruning to keep frequently-used data revealed.
+    /// 下层子 trie 的热度追踪器，用于智能剪枝决策。
+    /// 热门子 trie 在剪枝时被跳过，保持其揭示状态。
     subtrie_heat: SubtrieModifications,
     /// Metrics for the parallel sparse trie.
     #[cfg(feature = "metrics")]

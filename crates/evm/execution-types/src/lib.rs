@@ -1,4 +1,9 @@
-//! Commonly used types for (EVM) block execution.
+//! EVM 区块执行的常用类型定义。
+//!
+//! 本 crate 定义了区块执行结果的数据结构:
+//! - [`ExecutionOutcome`]: 聚合多个区块执行后的状态变更、收据和请求
+//! - [`BlockExecutionOutput`]: 单个区块执行的输出（状态变更 + 执行结果）
+//! - [`Chain`]: 一条区块链（多个区块 + 执行状态），用于 BlockchainTree 中
 
 #![doc(
     html_logo_url = "https://raw.githubusercontent.com/paradigmxyz/reth/main/assets/reth-docs.png",

@@ -6,30 +6,37 @@ use alloy_trie::proof::AddedRemovedKeys;
 use reth_storage_errors::db::DatabaseError;
 use tracing::{instrument, trace};
 
-/// Represents a branch node in the trie.
+/// Trie 分支节点的表示。
+///
+/// 当 TrieNodeIter 返回一个中间节点（即有子节点的分支）时，使用此结构。
+/// 包含节点的键路径、哈希值和子树是否存在于 trie 中的标志。
 #[derive(Debug)]
 pub struct TrieBranchNode {
-    /// The key associated with the node.
+    /// 节点关联的键（nibbles 路径）。
     pub key: Nibbles,
-    /// The value associated with the node.
+    /// 节点的哈希值（B256），即该子树的根哈希。
     pub value: B256,
-    /// Indicates whether children are in the trie.
+    /// 子节点是否在 trie 中（用于 HashBuilder 决定是否标记 tree_mask）。
     pub children_are_in_trie: bool,
 }
 
 impl TrieBranchNode {
-    /// Creates a new `TrieBranchNode`.
+    /// 创建新的 `TrieBranchNode`。
     pub const fn new(key: Nibbles, value: B256, children_are_in_trie: bool) -> Self {
         Self { key, value, children_are_in_trie }
     }
 }
 
-/// Represents variants of trie nodes returned by the iteration.
+/// 迭代过程中返回的 trie 元素变体。
+///
+/// 在状态根计算中，HashBuilder 需要按字典序接收两种元素:
+/// - **Branch**: 中间分支节点（已有哈希值，可直接使用）
+/// - **Leaf**: 叶子节点（实际的账户或存储数据，需要 RLP 编码后哈希）
 #[derive(Debug)]
 pub enum TrieElement<Value> {
-    /// Branch node.
+    /// 分支节点（中间节点）。
     Branch(TrieBranchNode),
-    /// Leaf node.
+    /// 叶子节点（键是 keccak256 哈希，值是账户/存储数据）。
     Leaf(B256, Value),
 }
 
@@ -44,20 +51,30 @@ struct SeekedHashedEntry<V> {
     result: Option<(B256, V)>,
 }
 
-/// Iterates over trie nodes for hash building.
+/// Trie 节点迭代器 —— 为 HashBuilder 提供按字典序排列的 trie 元素。
 ///
-/// This iterator depends on the ordering guarantees of [`TrieCursor`],
-/// and additionally uses hashed cursor lookups when operating on storage tries.
+/// 这是状态根计算的核心迭代器。它组合了:
+/// - `TrieWalker`（遍历数据库中的中间分支节点）
+/// - `HashedCursor`（遍历哈希后的叶子数据）
+///
+/// ## 迭代算法
+/// 1. 如果当前中间节点未被更新（可跳过），返回它作为 Branch 元素
+/// 2. 推进 walker 到下一个中间节点，获取下一个未处理的键
+/// 3. 将哈希游标定位到该键
+/// 4. 返回所有在当前中间节点键之前的哈希条目作为 Leaf 元素
+/// 5. 重复以上过程
+///
+/// ## 断点续传
+/// 通过 `previous_hashed_key` 支持从上次中断的位置恢复迭代。
 #[derive(Debug)]
 pub struct TrieNodeIter<C, H: HashedCursor, K> {
-    /// The walker over intermediate nodes.
+    /// 中间节点遍历器。
     pub walker: TrieWalker<C, K>,
-    /// The cursor for the hashed entries.
+    /// 哈希条目游标（用于获取叶子数据）。
     pub hashed_cursor: H,
-    /// The type of the trie.
+    /// Trie 类型（State 状态 trie 或 Storage 存储 trie）。
     trie_type: TrieType,
-    /// The previous hashed key. If the iteration was previously interrupted, this value can be
-    /// used to resume iterating from the last returned leaf node.
+    /// 上一个哈希键。如果迭代之前被中断，此值用于从最后返回的叶子节点恢复迭代。
     previous_hashed_key: Option<B256>,
 
     /// Current hashed  entry.

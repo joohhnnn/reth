@@ -1,4 +1,22 @@
-//! Traits for configuring an EVM specifics.
+//! EVM 配置相关的 trait 定义。
+//!
+//! 本模块定义了 reth 中 EVM（以太坊虚拟机）执行的核心抽象层。
+//! 主要包含:
+//! - [`ConfigureEvm`] trait: EVM 配置的核心入口，负责创建 EVM 环境、区块执行器和区块组装器
+//! - [`TransactionEnv`] trait: 交易环境的抽象，允许设置 gas 限制、nonce、访问列表等
+//! - [`NextBlockEnvAttributes`]: 下一个区块的环境属性（时间戳、手续费接收者、随机数等）
+//!
+//! ## 架构概览
+//!
+//! EVM 抽象分为三层:
+//! 1. **Evm（由 EvmFactory 创建）**: 核心 EVM 实现，负责执行单个交易
+//! 2. **BlockExecutor（由 BlockExecutorFactory 创建）**: 在 Evm 之上执行整个区块
+//! 3. **BlockAssembler**: 从执行结果组装出完整的区块
+//!
+//! ## 两种使用模式
+//!
+//! 1. **执行已有区块**（同步时）: `executor.execute(&block)`
+//! 2. **构建新区块**（出块时）: `builder_for_next_block()` → 执行交易 → `finish()`
 //!
 //! # Revm features
 //!
@@ -61,7 +79,23 @@ pub use alloy_evm::{
     *,
 };
 
-/// A complete configuration of EVM for Reth.
+/// Reth 的完整 EVM 配置 trait。
+///
+/// 这是 EVM 执行的核心 trait，封装了交易执行和区块执行/构建所需的全部配置，
+/// 提供了统一的 EVM 操作接口。
+///
+/// ## 关联类型说明
+/// - `Primitives`: 链特定的原语类型（如 EthPrimitives 用于以太坊主网）
+/// - `Error`: EVM 操作返回的错误类型
+/// - `NextBlockEnvCtx`: 配置下一个区块环境所需的上下文（CL 提供的属性）
+/// - `BlockExecutorFactory`: 区块执行器工厂，内部包含 EvmFactory
+/// - `BlockAssembler`: 区块组装器，将执行结果组装成完整区块
+///
+/// ## 核心方法
+/// - `evm_env()`: 从区块头创建 EVM 环境
+/// - `next_evm_env()`: 为下一个区块创建 EVM 环境（需要 CL 属性）
+/// - `executor()`: 创建区块执行器（用于执行已有区块）
+/// - `builder_for_next_block()`: 创建区块构建器（用于出块）
 ///
 /// This trait encapsulates complete configuration required for transaction execution and block
 /// execution/building, providing a unified interface for EVM operations.
@@ -182,18 +216,19 @@ pub use alloy_evm::{
 /// [`BlockExecutor`]: alloy_evm::block::BlockExecutor
 #[auto_impl::auto_impl(&, Arc)]
 pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
-    /// The primitives type used by the EVM.
+    /// EVM 使用的原语类型（区块、交易、收据等链特定类型）。
+    /// 例如以太坊主网使用 EthPrimitives，Optimism 使用 OpPrimitives。
     type Primitives: NodePrimitives;
 
-    /// The error type that is returned by [`Self::next_evm_env`].
+    /// [`Self::next_evm_env`] 返回的错误类型。
     type Error: Error + Send + Sync + 'static;
 
-    /// Context required for configuring next block environment.
-    ///
-    /// Contains values that can't be derived from the parent block.
+    /// 配置下一个区块环境所需的上下文。
+    /// 包含无法从父区块派生的值（由共识层提供），如时间戳、随机数等。
     type NextBlockEnvCtx: Debug + Clone;
 
-    /// Configured [`BlockExecutorFactory`], contains [`EvmFactory`] internally.
+    /// 已配置的区块执行器工厂，内部包含 [`EvmFactory`]。
+    /// 负责创建 BlockExecutor，后者负责执行整个区块的交易。
     type BlockExecutorFactory: for<'a> BlockExecutorFactory<
         Transaction = TxTy<Self::Primitives>,
         Receipt = ReceiptTy<Self::Primitives>,
@@ -207,7 +242,7 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
         >,
     >;
 
-    /// A type that knows how to build a block.
+    /// 区块组装器类型。负责将执行结果（收据、gas 使用量等）组装成完整的区块。
     type BlockAssembler: BlockAssembler<
         Self::BlockExecutorFactory,
         Block = BlockTy<Self::Primitives>,
@@ -490,23 +525,26 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
 /// - **Assembly** (creating the final block) - handled by `BlockAssembler`
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NextBlockEnvAttributes {
-    /// The timestamp of the next block.
+    /// 下一个区块的时间戳（由共识层提供）。
     pub timestamp: u64,
-    /// The suggested fee recipient for the next block.
+    /// 建议的手续费接收者地址（coinbase/beneficiary），即矿工/验证者地址。
     pub suggested_fee_recipient: Address,
-    /// The randomness value for the next block.
+    /// 随机数值（PoS 后由 Beacon 链的 RANDAO 提供，替代了 PoW 的 difficulty）。
     pub prev_randao: B256,
-    /// Block gas limit.
+    /// 区块 gas 上限。
     pub gas_limit: u64,
-    /// The parent beacon block root.
+    /// 父 Beacon 区块根（EIP-4788），用于在 EVM 中访问 Beacon 链状态。
     pub parent_beacon_block_root: Option<B256>,
-    /// Withdrawals
+    /// 共识层提款列表（EIP-4895，上海升级引入）。
     pub withdrawals: Option<Withdrawals>,
-    /// Optional extra data.
+    /// 可选的额外数据字段。
     pub extra_data: Bytes,
 }
 
-/// Abstraction over transaction environment.
+/// 交易环境的抽象 trait。
+///
+/// 提供对交易执行环境的统一操作接口，包括设置 gas 限制、nonce 和访问列表。
+/// 主要实现者是 revm 的 `TxEnv` 和 Optimism 的 `OpTransaction`。
 pub trait TransactionEnv:
     revm::context_interface::Transaction + Debug + Clone + Send + Sync + 'static
 {

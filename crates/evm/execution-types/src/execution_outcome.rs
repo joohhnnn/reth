@@ -37,27 +37,42 @@ impl ChangedAccount {
     }
 }
 
-/// Represents the outcome of block execution, including post-execution changes and reverts.
+/// 区块执行结果的聚合，包含执行后的状态变更和回滚信息。
 ///
-/// The `ExecutionOutcome` structure aggregates the state changes over an arbitrary number of
-/// blocks, capturing the resulting state, receipts, and requests following the execution.
+/// `ExecutionOutcome` 聚合了任意数量区块的执行结果，捕获最终状态、收据和请求。
+/// 这是 reth 中追踪区块执行状态的核心数据结构。
+///
+/// ## 使用场景
+/// - **区块同步**: pipeline stages 执行区块后产生 ExecutionOutcome
+/// - **区块构建**: 构建新区块时累积执行结果
+/// - **状态回滚**: 通过 `revert_to()` 回滚到指定区块
+/// - **状态分割**: 通过 `split_at()` 在指定区块号处分割状态
+///
+/// ## 数据结构
+/// ```text
+/// ExecutionOutcome {
+///   bundle:      BundleState    ← 所有账户/存储的状态变更 + 回滚信息
+///   receipts:    Vec<Vec<T>>    ← receipts[block_index][tx_index]
+///   first_block: BlockNumber    ← 第一个区块号（用于索引转换）
+///   requests:    Vec<Requests>  ← requests[block_index]（EIP-7685）
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ExecutionOutcome<T = reth_ethereum_primitives::Receipt> {
-    /// Bundle state with reverts.
+    /// Bundle 状态，包含所有账户的状态变更及回滚信息。
+    /// BundleState 来自 revm，追踪每个账户的 original → present 变化，
+    /// 以及每个区块的 reverts（用于回滚）。
     pub bundle: BundleState,
-    /// The collection of receipts.
-    /// Outer vector stores receipts for each block sequentially.
-    /// The inner vector stores receipts ordered by transaction number.
+    /// 收据集合。外层 Vec 按区块顺序存储，内层 Vec 按交易顺序存储。
+    /// receipts[0] 是第一个区块的所有交易收据。
     pub receipts: Vec<Vec<T>>,
-    /// First block of bundle state.
+    /// Bundle 状态的起始区块号。用于将区块号转换为数组索引:
+    /// index = block_number - first_block
     pub first_block: BlockNumber,
-    /// The collection of EIP-7685 requests.
-    /// Outer vector stores requests for each block sequentially.
-    /// The inner vector stores requests ordered by transaction number.
-    ///
-    /// A transaction may have zero or more requests, so the length of the inner vector is not
-    /// guaranteed to be the same as the number of transactions.
+    /// EIP-7685 请求集合（如验证者提款请求等）。
+    /// 外层 Vec 按区块顺序存储，内层包含该区块的所有请求。
+    /// 一个交易可能产生零个或多个请求。
     pub requests: Vec<Requests>,
 }
 

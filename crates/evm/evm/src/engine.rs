@@ -3,7 +3,10 @@ use alloy_evm::{block::ExecutableTxParts, RecoveredTx};
 use rayon::prelude::*;
 use reth_primitives_traits::TxTy;
 
-/// [`ConfigureEvm`] extension providing methods for executing payloads.
+/// [`ConfigureEvm`] 的扩展 trait，提供执行 payload（有效载荷）的方法。
+///
+/// 专门用于 Engine API 场景（处理来自共识层的 newPayload 请求）。
+/// 提供从 payload 数据创建 EVM 环境和交易迭代器的方法。
 pub trait ConfigureEngineEvm<ExecutionData>: ConfigureEvm {
     /// Returns an [`crate::EvmEnv`] for the given payload.
     fn evm_env_for_payload(&self, payload: &ExecutionData) -> Result<EvmEnvFor<Self>, Self::Error>;
@@ -21,9 +24,11 @@ pub trait ConfigureEngineEvm<ExecutionData>: ConfigureEvm {
     ) -> Result<impl ExecutableTxIterator<Self>, Self::Error>;
 }
 
-/// A helper trait representing a pair of a "raw" transactions iterator and a closure that can be
-/// used to convert them to an executable transaction. This tuple is used in the engine to
-/// parallelize heavy work like decoding or recovery.
+/// 辅助 trait：表示"原始"交易迭代器和转换闭包的配对。
+///
+/// 用于 Engine 中并行化解码或恢复签名等重计算工作。
+/// 例如，原始交易可能是未恢复签名的交易字节，转换闭包负责恢复发送者地址。
+/// 这种设计允许使用 rayon 并行处理交易恢复。
 pub trait ExecutableTxTuple: Into<(Self::IntoIter, Self::Convert)> + Send + 'static {
     /// Raw transaction that can be converted to an [`ExecutableTxTuple::Tx`]
     ///

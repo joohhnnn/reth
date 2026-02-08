@@ -12,12 +12,25 @@ use reth_primitives_traits::{
 };
 use reth_trie_common::LazyTrieData;
 
-/// A chain of blocks and their final state.
+/// 一条区块链及其最终状态。
 ///
-/// The chain contains the state of accounts after execution of its blocks,
-/// changesets for those blocks (and their transactions), as well as the blocks themselves.
+/// Chain 包含了执行区块后的账户状态、区块的变更集（changeset）以及区块本身。
+/// 在 `BlockchainTree` 内部使用，表示一条可能的链分支。
 ///
-/// Used inside the `BlockchainTree`.
+/// ## 结构
+/// ```text
+/// Chain {
+///   blocks:            BTreeMap<BlockNumber, Block>  ← 按区块号排序的区块
+///   execution_outcome: ExecutionOutcome              ← 执行后的聚合状态
+///   trie_data:         BTreeMap<BlockNumber, Trie>   ← 每个区块的 trie 更新数据
+/// }
+/// ```
+///
+/// ## 核心操作
+/// - `append_block()`: 追加单个区块
+/// - `append_chain()`: 合并另一条链
+/// - `fork_block()`: 获取分叉点
+/// - `execution_outcome_at_block()`: 获取某个区块的执行结果
 ///
 /// # Warning
 ///
@@ -25,18 +38,14 @@ use reth_trie_common::LazyTrieData;
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Chain<N: NodePrimitives = reth_ethereum_primitives::EthPrimitives> {
-    /// All blocks in this chain.
+    /// 链中的所有区块，按区块号排序（BTreeMap 保证有序）。
     blocks: BTreeMap<BlockNumber, RecoveredBlock<N::Block>>,
-    /// The outcome of block execution for this chain.
-    ///
-    /// This field contains the state of all accounts after the execution of all blocks in this
-    /// chain, ranging from the [`Chain::first`] block to the [`Chain::tip`] block, inclusive.
-    ///
-    /// Additionally, it includes the individual state changes that led to the current state.
+    /// 该链的区块执行结果。
+    /// 包含从第一个区块到链尾区块（inclusive）执行后的所有账户状态，
+    /// 以及导致当前状态的各个状态变更。
     execution_outcome: ExecutionOutcome<N::Receipt>,
-    /// Lazy trie data for each block in the chain, keyed by block number.
-    ///
-    /// Contains handles to lazily-initialized sorted trie updates and hashed state.
+    /// 每个区块的延迟初始化 trie 数据，按区块号索引。
+    /// 包含排序后的 trie 更新和哈希状态的句柄。
     trie_data: BTreeMap<BlockNumber, LazyTrieData>,
 }
 

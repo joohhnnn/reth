@@ -20,25 +20,46 @@ use reth_execution_errors::{StateRootError, StorageRootError};
 use reth_primitives_traits::Account;
 use tracing::{debug, instrument, trace};
 
-/// The default updates after which root algorithms should return intermediate progress rather than
-/// finishing the computation.
+/// 默认的中间进度阈值：当更新数量超过此值时，根计算算法应返回中间进度而非完成计算。
+/// 设为 100,000，这意味着每处理约 10 万个更新就会产生一个检查点，
+/// 防止长时间阻塞并允许断点续传。
 const DEFAULT_INTERMEDIATE_THRESHOLD: u64 = 100_000;
 
 #[cfg(feature = "metrics")]
 use crate::metrics::{StateRootMetrics, TrieRootMetrics};
 
-/// `StateRoot` is used to compute the root node of a state trie.
+/// 状态根计算器 —— 计算整个世界状态的 Merkle Patricia Trie 根哈希。
+///
+/// ## 工作原理
+/// 1. 使用 `TrieCursorFactory`（T）遍历数据库中已存储的 trie 中间节点
+/// 2. 使用 `HashedCursorFactory`（H）遍历哈希后的账户数据
+/// 3. 通过 `TrieWalker` 按字典序遍历，结合 `prefix_sets` 跳过未变更的子树
+/// 4. 对每个账户计算其 `StorageRoot`（存储根）
+/// 5. 将账户数据（nonce, balance, storage_root, code_hash）RLP 编码后
+///    喂给 `HashBuilder` 构建 MPT 哈希
+/// 6. 最终得到 32 字节的状态根哈希（B256）
+///
+/// ## 泛型参数
+/// - `T`: TrieCursorFactory — 创建读取数据库 trie 节点的游标
+/// - `H`: HashedCursorFactory — 创建读取哈希账户/存储数据的游标
+///
+/// ## 增量计算
+/// 通过 `prefix_sets` 标记哪些路径发生了变更，仅重算变更部分。
+/// 未变更的子树直接复用已存储的哈希值。
 #[derive(Debug)]
 pub struct StateRoot<T, H> {
-    /// The factory for trie cursors.
+    /// Trie 游标工厂 —— 用于创建遍历数据库中 trie 分支节点的游标。
     pub trie_cursor_factory: T,
-    /// The factory for hashed cursors.
+    /// 哈希游标工厂 —— 用于创建遍历哈希账户和存储数据的游标。
     pub hashed_cursor_factory: H,
-    /// A set of prefix sets that have changed.
+    /// 发生变更的前缀集合。包含:
+    /// - account_prefix_set: 变更的账户路径前缀
+    /// - storage_prefix_sets: 每个账户变更的存储路径前缀
+    /// - destroyed_accounts: 被销毁的账户集合
     pub prefix_sets: TriePrefixSets,
-    /// Previous intermediate state.
+    /// 之前的中间状态（用于断点续传）。
     previous_state: Option<IntermediateStateRootState>,
-    /// The number of updates after which the intermediate progress should be returned.
+    /// 达到此更新数量后应返回中间进度（而非完成计算）。
     threshold: u64,
     #[cfg(feature = "metrics")]
     /// State root metrics.
@@ -330,16 +351,18 @@ where
     }
 }
 
-/// Contains state mutated during state root calculation and storage root result handling.
+/// 状态根计算过程中的可变上下文。
+///
+/// 在遍历账户和处理存储根结果时，此结构体保存计算过程中的中间状态。
 #[derive(Debug)]
 pub(crate) struct StateRootContext {
-    /// Reusable buffer for encoding account data.
+    /// 可复用的 RLP 编码缓冲区（避免每个账户都分配新的 Vec）。
     account_rlp: Vec<u8>,
-    /// Accumulates updates from account and storage root calculation.
+    /// 累积的 trie 更新（需要写入数据库的新增/删除节点）。
     trie_updates: TrieUpdates,
-    /// Tracks total hashed entries walked.
+    /// 已遍历的哈希条目总数（用于统计）。
     hashed_entries_walked: usize,
-    /// Counts storage trie nodes updated.
+    /// 已更新的存储 trie 节点数量。
     updated_storage_nodes: usize,
 }
 
@@ -454,16 +477,28 @@ impl StateRootContext {
     }
 }
 
-/// `StorageRoot` is used to compute the root node of an account storage trie.
+/// 存储根计算器 —— 计算单个账户的存储 Merkle Patricia Trie 根哈希。
+///
+/// 每个以太坊账户都有自己的存储 trie（独立于全局状态 trie）。
+/// 存储 trie 的叶子节点是 storage_slot → value 的映射。
+///
+/// ## 工作原理
+/// 与 StateRoot 类似，但作用域限定在单个账户的存储上:
+/// 1. 使用 trie cursor 遍历该账户的存储 trie 中间节点
+/// 2. 使用 hashed cursor 遍历该账户的哈希存储数据
+/// 3. 通过 HashBuilder 构建存储 trie 的根哈希
+///
+/// ## 空存储优化
+/// 如果账户没有存储数据，直接返回 EMPTY_ROOT_HASH（空 trie 的根哈希）。
 #[derive(Debug)]
 pub struct StorageRoot<T, H> {
-    /// A reference to the database transaction.
+    /// Trie 游标工厂。
     pub trie_cursor_factory: T,
-    /// The factory for hashed cursors.
+    /// 哈希游标工厂。
     pub hashed_cursor_factory: H,
-    /// The hashed address of an account.
+    /// 账户地址的 keccak256 哈希（用于在数据库中定位该账户的存储 trie）。
     pub hashed_address: B256,
-    /// The set of storage slot prefixes that have changed.
+    /// 发生变更的存储槽前缀集合。
     pub prefix_set: PrefixSet,
     /// Previous intermediate state.
     previous_state: Option<IntermediateRootState>,

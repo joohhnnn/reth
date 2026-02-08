@@ -1,4 +1,11 @@
-//! Errors when computing the state root.
+//! 计算状态根时的错误类型定义。
+//!
+//! 本模块定义了 Trie 操作过程中可能发生的各种错误:
+//! - [`StateRootError`]: 状态根计算错误（数据库错误、存储根错误、前缀集加载错误）
+//! - [`StorageRootError`]: 存储根计算错误
+//! - [`StateProofError`]: 状态证明生成错误
+//! - [`SparseStateTrieError`] / [`SparseTrieError`]: 稀疏 Trie 操作错误
+//! - [`TrieWitnessError`]: Trie 见证数据生成错误
 
 use alloc::{boxed::Box, string::ToString};
 use alloy_primitives::{Bytes, B256};
@@ -6,16 +13,21 @@ use nybbles::Nibbles;
 use reth_storage_errors::{db::DatabaseError, provider::ProviderError};
 use thiserror::Error;
 
-/// State root errors.
+/// 状态根计算错误。
+///
+/// 状态根（state root）是以太坊区块头中的关键字段，
+/// 它是整个世界状态的 Merkle Patricia Trie 根哈希。
+/// 计算过程中可能遇到数据库错误、存储根错误或前缀集加载错误。
 #[derive(Error, Clone, Debug)]
 pub enum StateRootError {
-    /// Internal database error.
+    /// 内部数据库错误（读取 trie 节点或账户数据失败）。
     #[error(transparent)]
     Database(#[from] DatabaseError),
-    /// Storage root error.
+    /// 存储根计算错误（某个账户的存储 trie 计算失败）。
     #[error(transparent)]
     StorageRootError(#[from] StorageRootError),
-    /// Provider error when loading prefix sets
+    /// 加载前缀集（prefix sets）时的 Provider 错误。
+    /// 前缀集用于标记哪些 trie 路径发生了变更，需要重新计算。
     #[error(transparent)]
     PrefixSetLoadError(#[from] ProviderError),
 }
@@ -151,13 +163,19 @@ impl SparseTrieError {
     }
 }
 
-/// [`SparseTrieError`] kind.
+/// [`SparseTrieError`] 的具体错误种类。
+///
+/// 稀疏 Trie 的节点分为两种状态:
+/// - **Blind（盲态）**: 仅存储哈希值，节点内容未加载
+/// - **Revealed（揭示态）**: 节点内容已加载到内存
+///
+/// 当尝试在盲态节点上执行更新/删除操作时，会产生以下错误。
 #[derive(Error, Debug)]
 pub enum SparseTrieErrorKind {
-    /// Sparse trie is still blind. Thrown on attempt to update it.
+    /// 稀疏 trie 仍处于盲态。在尝试更新时抛出。
     #[error("sparse trie is blind")]
     Blind,
-    /// Encountered blinded node on update.
+    /// 更新时遇到了盲态节点（需要先通过 reveal_nodes 加载）。
     #[error("attempted to update blind node at {path:?}: {hash}")]
     BlindedNode {
         /// Blind node path.

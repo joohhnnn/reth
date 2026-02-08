@@ -1,4 +1,8 @@
-//! Helpers for testing.
+//! 测试辅助工具。
+//!
+//! 提供 `NoopEvmConfig`，一个空操作的 EVM 配置实现。
+//! 它满足 [`ConfigureEvm`] 的类型约束但任何方法调用都会 panic。
+//! 仅用于测试场景中需要一个 ConfigureEvm 类型但不会实际调用的情况。
 
 use crate::{ConfigureEvm, EvmEnvFor};
 use reth_primitives_traits::{BlockTy, HeaderTy, SealedBlock, SealedHeader};

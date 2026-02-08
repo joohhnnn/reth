@@ -11,22 +11,32 @@ use tracing::{instrument, trace};
 #[cfg(feature = "metrics")]
 use crate::metrics::WalkerMetrics;
 
-/// Traverses the trie in lexicographic order.
+/// Trie 遍历器 —— 按字典序遍历 trie 的中间节点。
 ///
-/// This iterator depends on the ordering guarantees of [`TrieCursor`].
+/// TrieWalker 是状态根计算的关键组件之一。它使用 [`TrieCursor`] 读取数据库中
+/// 已存储的 trie 分支节点，并根据 `PrefixSet`（变更前缀集）决定哪些子树可以跳过。
+///
+/// ## 跳过优化
+/// 当一个子树没有发生变更（其前缀不在 PrefixSet 中）且有有效的哈希值时，
+/// walker 可以跳过该子树，直接使用已存储的哈希值。
+/// 这是增量状态根计算高效的关键。
+///
+/// ## 与 TrieNodeIter 的配合
+/// TrieWalker 负责提供中间节点（Branch），TrieNodeIter 组合它与 HashedCursor
+/// 来同时提供中间节点和叶子节点（Leaf），最终喂给 HashBuilder。
 #[derive(Debug)]
 pub struct TrieWalker<C, K = AddedRemovedKeys> {
-    /// A mutable reference to a trie cursor instance used for navigating the trie.
+    /// Trie 游标实例，用于从数据库读取和导航 trie 节点。
     pub cursor: C,
-    /// A vector containing the trie nodes that have been visited.
+    /// 已访问的 trie 节点栈。栈顶是当前节点，用于深度优先遍历。
     pub stack: Vec<CursorSubNode>,
-    /// A flag indicating whether the current node can be skipped when traversing the trie. This
-    /// is determined by whether the current key's prefix is included in the prefix set and if the
-    /// hash flag is set.
+    /// 当前节点是否可以跳过的标志。
+    /// 当当前键的前缀不在变更集中（未修改）且设置了哈希标志时为 true。
     pub can_skip_current_node: bool,
-    /// A `PrefixSet` representing the changes to be applied to the trie.
+    /// 表示需要应用到 trie 的变更的前缀集合。
+    /// 只有前缀匹配的路径才需要重新计算。
     pub changes: PrefixSet,
-    /// The retained trie node keys that need to be removed.
+    /// 需要删除的 trie 节点键集合（用于追踪需要从数据库删除的过时节点）。
     removed_keys: Option<HashSet<Nibbles>>,
     /// Provided when it's necessary not to skip certain nodes during proof generation.
     /// Specifically we don't skip certain branch nodes even when they are not in the `PrefixSet`,

@@ -25,21 +25,26 @@ use thiserror::Error;
 use tokio::runtime::{Builder, Handle, Runtime};
 use tracing::*;
 
-/// Parallel incremental state root calculator.
+/// 并行增量状态根计算器。
 ///
-/// The calculator starts off by launching tasks to compute storage roots.
-/// Then, it immediately starts walking the state trie updating the necessary trie
-/// nodes in the process. Upon encountering a leaf node, it will poll the storage root
-/// task for the corresponding hashed address.
+/// ## 工作原理
+/// 1. 首先启动并行任务计算每个已修改账户的存储根（storage root）
+/// 2. 同时开始遍历状态 trie，更新必要的 trie 节点
+/// 3. 遇到叶子节点时，从对应的并行任务获取存储根结果
 ///
-/// Note: This implementation only serves as a fallback for the sparse trie-based
-/// state root calculation. The sparse trie approach is more efficient as it avoids traversing
-/// the entire trie, only operating on the modified parts.
+/// ## 并行策略
+/// 不同账户的存储根计算是完全独立的，因此可以并行执行。
+/// 使用 tokio 的 `spawn_blocking` 在独立线程中计算每个账户的存储根，
+/// 通过 `mpsc::sync_channel` 传递结果。
+///
+/// ## 定位
+/// 此实现仅作为稀疏 trie 方式状态根计算的备选方案。
+/// 稀疏 trie 方式更高效，因为它避免遍历整棵 trie，只操作变更部分。
 #[derive(Debug)]
 pub struct ParallelStateRoot<Factory> {
-    /// Factory for creating state providers.
+    /// 状态提供者工厂（用于创建数据库读取事务）。
     factory: Factory,
-    // Prefix sets indicating which portions of the trie need to be recomputed.
+    /// 前缀集合，指示 trie 的哪些部分需要重新计算。
     prefix_sets: TriePrefixSets,
     /// Parallel state root metrics.
     #[cfg(feature = "metrics")]
@@ -223,19 +228,19 @@ where
     }
 }
 
-/// Error during parallel state root calculation.
+/// 并行状态根计算过程中的错误类型。
 #[derive(Error, Debug)]
 pub enum ParallelStateRootError {
-    /// Error while calculating storage root.
+    /// 计算存储根时出错（数据库 I/O 错误等）。
     #[error(transparent)]
     StorageRoot(#[from] StorageRootError),
-    /// Provider error.
+    /// 状态提供者错误。
     #[error(transparent)]
     Provider(#[from] ProviderError),
-    /// Sparse trie error.
+    /// 稀疏 trie 操作错误。
     #[error(transparent)]
     SparseTrie(#[from] SparseTrieError),
-    /// Other unspecified error.
+    /// 其他未分类错误。
     #[error("{_0}")]
     Other(String),
 }

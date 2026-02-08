@@ -30,34 +30,35 @@ use tracing::{debug, instrument, trace};
 /// [`SerialSparseTrie::update_subtrie_hashes`].
 const SPARSE_TRIE_SUBTRIE_HASHES_LEVEL: usize = 2;
 
-/// A sparse trie that is either in a "blind" state (no nodes are revealed, root node hash is
-/// unknown) or in a "revealed" state (root node has been revealed and the trie can be updated).
+/// 可揭示的稀疏 trie —— 盲态/揭示态的状态机包装。
 ///
-/// In blind mode the trie does not contain any decoded node data, which saves memory but
-/// prevents direct access to node contents. The revealed mode stores decoded nodes along
-/// with additional information such as values, allowing direct manipulation.
+/// 稀疏 trie 有两种状态:
+/// - **盲态 (Blind)**: 没有揭示任何节点，不能直接查询或修改 trie 内容
+/// - **揭示态 (Revealed)**: 根节点已揭示，可以对已揭示的部分进行查询和修改
 ///
-/// The sparse trie design is optimised for:
-/// 1. Memory efficiency - only revealed nodes are loaded into memory
-/// 2. Update tracking - changes to the trie structure can be tracked and selectively persisted
-/// 3. Incremental operations - nodes can be revealed as needed without loading the entire trie.
-///    This is what gives rise to the notion of a "sparse" trie.
+/// ## 状态转换
+/// ```text
+/// Blind → reveal_root(root_node) → Revealed
+/// Revealed → clear() → Blind（保留已分配内存）
+/// ```
+///
+/// ## 设计优化
+/// 1. **内存效率**: 只有揭示的节点加载到内存
+/// 2. **变更追踪**: trie 结构变更可被追踪并选择性持久化
+/// 3. **增量操作**: 按需揭示节点，无需加载整棵 trie（"稀疏"的由来）
+/// 4. **内存复用**: 盲态可携带已清除的 trie 实例，复用其内存分配
 #[derive(PartialEq, Eq, Debug, Clone)]
 pub enum RevealableSparseTrie<T = SerialSparseTrie> {
-    /// The trie is blind -- no nodes have been revealed
+    /// 盲态 —— 没有揭示任何节点。
     ///
-    /// This is the default state. In this state, the trie cannot be directly queried or modified
-    /// until nodes are revealed.
-    ///
-    /// In this state the `RevealableSparseTrie` can optionally carry with it a cleared
-    /// `SerialSparseTrie`. This allows for reusing the trie's allocations between payload
-    /// executions.
+    /// 这是默认状态。在此状态下，trie 不能直接查询或修改。
+    /// 可选携带一个已清除的 trie 实例（`Option<Box<T>>`），
+    /// 用于在不同 payload 执行间复用内存分配。
     Blind(Option<Box<T>>),
-    /// Some nodes in the Trie have been revealed.
+    /// 揭示态 —— 部分或全部节点已揭示。
     ///
-    /// In this state, the trie can be queried and modified for the parts
-    /// that have been revealed. Other parts remain blind and require revealing
-    /// before they can be accessed.
+    /// 在此状态下，已揭示的部分可以查询和修改，
+    /// 未揭示的部分仍处于盲态，需要先揭示才能访问。
     Revealed(Box<T>),
 }
 
@@ -318,39 +319,43 @@ impl<T: SparseTrieExt + Default> RevealableSparseTrie<T> {
     }
 }
 
-/// The representation of revealed sparse trie.
+/// 串行稀疏 trie 的揭示态实现。
 ///
-/// The revealed sparse trie contains the actual trie structure with nodes, values, and
-/// tracking for changes. It supports operations like inserting, updating, and removing
-/// nodes.
+/// 包含实际的 trie 结构（节点、值、变更追踪），支持节点的插入、更新和删除操作。
+/// 这是稀疏 trie 的核心数据结构，所有 trie 操作最终都在此结构上执行。
 ///
+/// ## 数据存储方式
+/// - `nodes`: 路径 → 节点映射（Branch/Extension/Leaf/Hash/Empty）
+/// - `values`: 叶子路径 → 叶子值映射（值与节点分离存储）
+/// - `branch_node_masks`: 分支节点的持久化掩码（来自数据库）
 ///
-/// ## Invariants
+/// ## 不变式
+/// - 根节点始终存在于 `nodes` 集合中
+/// - `nodes` 中每个叶子条目必须在 `values` 中有对应条目，反之亦然
+/// - `values` 中所有键都是完整的叶子路径
 ///
-/// - The root node is always present in `nodes` collection.
-/// - Each leaf entry in `nodes` collection must have a corresponding entry in `values` collection.
-///   The opposite is also true.
-/// - All keys in `values` collection are full leaf paths.
+/// ## 根哈希计算
+/// 1. 从 `prefix_set` 确定哪些子树需要重新计算
+/// 2. 自底向上递归计算每个脏节点的 RLP 编码
+/// 3. 如果 RLP >= 32 字节，取 keccak256 哈希；否则内联存储
+/// 4. 根节点的哈希即为最终的根哈希
 #[derive(Clone, PartialEq, Eq)]
 pub struct SerialSparseTrie {
-    /// Map from a path (nibbles) to its corresponding sparse trie node.
-    /// This contains all of the revealed nodes in trie.
+    /// 路径 → 稀疏节点映射（包含所有已揭示的 trie 节点）。
     nodes: HashMap<Nibbles, SparseNode>,
-    /// Branch node masks containing `tree_mask` and `hash_mask` for each path.
-    /// - `tree_mask`: When a bit is set, the corresponding child subtree is stored in the
-    ///   database.
-    /// - `hash_mask`: When a bit is set, the corresponding child is stored as a hash in the
-    ///   database.
+    /// 分支节点掩码（来自数据库的 tree_mask 和 hash_mask）。
+    /// - `tree_mask`: 置位表示对应子树在数据库中存储了 trie 节点
+    /// - `hash_mask`: 置位表示对应子节点的哈希存储在数据库中
     branch_node_masks: BranchNodeMasksMap,
-    /// Map from leaf key paths to their values.
-    /// All values are stored here instead of directly in leaf nodes.
+    /// 叶子路径 → 叶子值映射。
+    /// 值独立于叶子节点存储，避免在节点操作时不必要地移动大值。
     values: HashMap<Nibbles, Vec<u8>>,
-    /// Set of prefixes (key paths) that have been marked as updated.
-    /// This is used to track which parts of the trie need to be recalculated.
+    /// 已标记为更新的前缀集合（脏路径）。
+    /// 用于追踪 trie 的哪些部分需要重新计算哈希。
     prefix_set: PrefixSetMut,
-    /// Optional tracking of trie updates for later use.
+    /// 可选的 trie 更新追踪（如果启用，记录已修改/删除的分支节点，用于写回数据库）。
     updates: Option<SparseTrieUpdates>,
-    /// Reusable buffer for RLP encoding of nodes.
+    /// 可复用的 RLP 编码缓冲区。
     rlp_buf: Vec<u8>,
 }
 
@@ -1829,23 +1834,23 @@ impl SerialSparseTrie {
     }
 }
 
-/// Enum representing sparse trie node type.
+/// 稀疏 trie 节点类型枚举（轻量级，仅携带类型信息，不含数据）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SparseNodeType {
-    /// Empty trie node.
+    /// 空节点。
     Empty,
-    /// A placeholder that stores only the hash for a node that has not been fully revealed.
+    /// 哈希占位符 —— 节点内容未揭示，仅知道哈希。
     Hash,
-    /// Sparse leaf node.
+    /// 叶子节点。
     Leaf,
-    /// Sparse extension node.
+    /// 扩展节点。
     Extension {
-        /// A flag indicating whether the extension node should be stored in the database.
+        /// 此扩展节点是否应存储在数据库 trie 中。
         store_in_db_trie: Option<bool>,
     },
-    /// Sparse branch node.
+    /// 分支节点。
     Branch {
-        /// A flag indicating whether the branch node should be stored in the database.
+        /// 此分支节点是否应存储在数据库 trie 中。
         store_in_db_trie: Option<bool>,
     },
 }
@@ -1872,49 +1877,47 @@ impl SparseNodeType {
     }
 }
 
-/// Enum representing trie nodes in sparse trie.
+/// 稀疏 trie 中的节点枚举 —— 表示 MPT 的五种节点类型。
+///
+/// ## 节点类型与 MPT 对应关系
+/// - `Empty`: 空 trie（无任何数据时的根节点）
+/// - `Hash`: 盲态节点（仅知道哈希，内容未加载）
+/// - `Leaf`: 叶子节点（存储键的剩余后缀，值在 `values` 映射中）
+/// - `Extension`: 扩展节点（压缩连续的单子节点路径）
+/// - `Branch`: 分支节点（最多 16 个子节点，用 state_mask 位图标记存在的子节点）
+///
+/// ## 哈希缓存
+/// Leaf/Extension/Branch 都有可选的 `hash` 字段用于缓存计算结果。
+/// 当对应路径被更新时，缓存失效（设为 None），需要重新计算。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SparseNode {
-    /// Empty trie node.
+    /// 空节点 —— 表示空 trie。
     Empty,
-    /// The hash of the node that was not revealed.
+    /// 哈希节点 —— 盲态，仅存储哈希值，节点内容未揭示。
     Hash(B256),
-    /// Sparse leaf node with remaining key suffix.
+    /// 叶子节点 —— 存储键后缀。
     Leaf {
-        /// Remaining key suffix for the leaf node.
+        /// 叶子节点的剩余键后缀（从当前路径位置到键末尾的 nibble 序列）。
         key: Nibbles,
-        /// Pre-computed hash of the sparse node.
-        /// Can be reused unless this trie path has been updated.
+        /// 预计算的节点哈希缓存。路径被更新时失效。
         hash: Option<B256>,
     },
-    /// Sparse extension node with key.
+    /// 扩展节点 —— 压缩连续单子节点路径。
     Extension {
-        /// The key slice stored by this extension node.
+        /// 扩展节点存储的键片段。
         key: Nibbles,
-        /// Pre-computed hash of the sparse node.
-        /// Can be reused unless this trie path has been updated.
-        ///
-        /// If [`None`], then the value is not known and should be calculated from scratch.
+        /// 预计算的节点哈希缓存。`None` 表示需要从头计算。
         hash: Option<B256>,
-        /// Pre-computed flag indicating whether the trie node should be stored in the database.
-        /// Can be reused unless this trie path has been updated.
-        ///
-        /// If [`None`], then the value is not known and should be calculated from scratch.
+        /// 预计算的"是否需要存储到数据库 trie"标志。`None` 表示需要从头计算。
         store_in_db_trie: Option<bool>,
     },
-    /// Sparse branch node with state mask.
+    /// 分支节点 —— 最多 16 个子节点。
     Branch {
-        /// The bitmask representing children present in the branch node.
+        /// 子节点存在位图（16 位，每位对应一个 hex nibble 0-f）。
         state_mask: TrieMask,
-        /// Pre-computed hash of the sparse node.
-        /// Can be reused unless this trie path has been updated.
-        ///
-        /// If [`None`], then the value is not known and should be calculated from scratch.
+        /// 预计算的节点哈希缓存。`None` 表示需要从头计算。
         hash: Option<B256>,
-        /// Pre-computed flag indicating whether the trie node should be stored in the database.
-        /// Can be reused unless this trie path has been updated.
-        ///
-        /// If [`None`], then the value is not known and should be calculated from scratch.
+        /// 预计算的"是否需要存储到数据库 trie"标志。`None` 表示需要从头计算。
         store_in_db_trie: Option<bool>,
     },
 }
